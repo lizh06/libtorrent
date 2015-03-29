@@ -575,26 +575,41 @@ namespace libtorrent
 			for (int i = 0; i < len; ++i, ++str)
 				crc.process_byte(to_lower(*str));
 		}
+
+		template <class CRC>
+		void process_path_lowercase(
+			boost::unordered_set<boost::uint32_t>& table
+			, CRC crc
+			, char const* str, int len)
+		{
+			if (len == 0) return;
+			for (int i = 0; i < len; ++i, ++str)
+			{
+				if (*str == TORRENT_SEPARATOR)
+					table.insert(crc.checksum());
+				crc.process_byte(to_lower(*str));
+			}
+			table.insert(crc.checksum());
+		}
 	}
 
-	boost::uint32_t file_storage::path_hash(int index
-		, std::string const& save_path) const
+	void file_storage::all_path_hashes(
+		boost::unordered_set<boost::uint32_t>& table) const
 	{
-		TORRENT_ASSERT_PRECOND(index >= 0 && index < int(m_paths.size()));
-		
 		boost::crc_optimal<32, 0x1EDC6F41, 0xFFFFFFFF, 0xFFFFFFFF, true, true> crc;
 
-		if (!save_path.empty())
+		if (!m_name.empty())
 		{
-			process_string_lowercase(crc, save_path.c_str(), save_path.size());
-			TORRENT_ASSERT(save_path[save_path.size()-1] != TORRENT_SEPARATOR);
+			process_string_lowercase(crc, m_name.c_str(), m_name.size());
+			TORRENT_ASSERT(m_name[m_name.size()-1] != TORRENT_SEPARATOR);
 			crc.process_byte(TORRENT_SEPARATOR);
 		}
 
-		process_string_lowercase(crc, m_name.c_str(), m_name.size());
-		crc.process_byte(TORRENT_SEPARATOR);
-		process_string_lowercase(crc, m_paths[index].c_str(), m_paths[index].size());
-		return crc.checksum();
+		for (int i = 0; i != int(m_paths.size()); ++i)
+		{
+			std::string const& p = m_paths[i];
+			process_path_lowercase(table, crc, p.c_str(), p.size());
+		}
 	}
 
 	boost::uint32_t file_storage::file_path_hash(int index
@@ -861,7 +876,8 @@ namespace libtorrent
 #endif // TORRENT_DEPRECATED
 	}
 
-	void file_storage::optimize(int pad_file_limit, int alignment)
+	void file_storage::optimize(int pad_file_limit, int alignment
+		, bool tail_padding)
 	{
 		if (alignment == -1)
 			alignment = m_piece_length;
@@ -938,38 +954,62 @@ namespace libtorrent
 				// then swap it in place. This minimizes the amount
 				// of copying of internal_file_entry, which is somewhat
 				// expensive (until we have move semantics)
-				int cur_index = i - m_files.begin();
-				int index = m_files.size();
-				m_files.push_back(internal_file_entry());
-				++m_num_files;
-				internal_file_entry& e = m_files.back();
-				// i may have been invalidated, refresh it
-				i = m_files.begin() + cur_index;
-				e.size = pad_size;
-				e.offset = off;
-				char name[30];
-				snprintf(name, sizeof(name), ".____padding_file/%d", padding_file);
-				std::string path = combine_path(m_name, name);
-				e.set_name(path.c_str());
-				e.pad_file = true;
-				off += pad_size;
-				++padding_file;
-
-				if (!m_mtime.empty()) m_mtime.resize(index + 1, 0);
-				if (!m_file_hashes.empty()) m_file_hashes.resize(index + 1, NULL);
-#ifndef TORRENT_NO_DEPRECATE
-				if (!m_file_base.empty()) m_file_base.resize(index + 1, 0);
-#endif
-
-				reorder_file(index, cur_index);
+				add_pad_file(pad_size, i, off, padding_file);
 
 				TORRENT_ASSERT((off % alignment) == 0);
 				continue;
 			}
 			i->offset = off;
 			off += i->size;
+
+			if (tail_padding
+				&& i->size > boost::uint32_t(pad_file_limit)
+				&& (off % alignment) != 0)
+			{
+				// skip the file we just put in place, so we put the pad
+				// file after it
+				++i;
+
+				// tail-padding is enabled, and the offset after this file is not
+				// aligned and it's not the last file. The last file must be padded
+				// too, in order to match an equivalent tail-padded file.
+				add_pad_file(alignment - (off % alignment), i, off, padding_file);
+
+				TORRENT_ASSERT((off % alignment) == 0);
+			}
 		}
 		m_total_size = off;
+	}
+
+	void file_storage::add_pad_file(int size
+		, std::vector<internal_file_entry>::iterator& i
+		, boost::int64_t& offset
+		, int& pad_file_counter)
+	{
+		int cur_index = i - m_files.begin();
+		int index = m_files.size();
+		m_files.push_back(internal_file_entry());
+		++m_num_files;
+		internal_file_entry& e = m_files.back();
+		// i may have been invalidated, refresh it
+		i = m_files.begin() + cur_index;
+		e.size = size;
+		e.offset = offset;
+		char name[30];
+		snprintf(name, sizeof(name), ".____padding_file/%d", pad_file_counter);
+		std::string path = combine_path(m_name, name);
+		e.set_name(path.c_str());
+		e.pad_file = true;
+		offset += size;
+		++pad_file_counter;
+
+		if (!m_mtime.empty()) m_mtime.resize(index + 1, 0);
+		if (!m_file_hashes.empty()) m_file_hashes.resize(index + 1, NULL);
+#ifndef TORRENT_NO_DEPRECATE
+		if (!m_file_base.empty()) m_file_base.resize(index + 1, 0);
+#endif
+
+		reorder_file(index, cur_index);
 	}
 
 	void file_storage::unload()
